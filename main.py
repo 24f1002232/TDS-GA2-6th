@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EMAIL = "YOUR_LOGIN_EMAIL_HERE"  # <-- replace with your actual login email
+EMAIL = "24f1002232@ds.study.iitm.ac.in"  # <-- replace with your actual login email
 START_TIME = time.time()
 
 REQUEST_COUNTER = Counter("http_requests_total", "Total HTTP requests")
