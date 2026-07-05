@@ -3,12 +3,15 @@ import uuid
 import logging
 import json
 import re
+import base64
 from datetime import datetime
 from collections import deque
-from fastapi import FastAPI, Request
+from typing import Optional
+
+from fastapi import FastAPI, Request, Header, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
-from starlette.responses import Response
+from starlette.responses import Response, JSONResponse
 from pydantic import BaseModel
 from dateutil import parser as dateparser
 
@@ -38,6 +41,32 @@ def add_log(level: str, path: str, request_id: str, **extra):
     entry.update(extra)
     LOG_BUFFER.append(entry)
     logging.info(json.dumps(entry))
+
+
+# ---------- Rate limiting config ----------
+RATE_LIMIT = 17
+RATE_WINDOW = 10  # seconds
+rate_buckets = {}  # client_id -> deque of timestamps
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_id = request.headers.get("X-Client-Id")
+    if client_id:
+        now = time.time()
+        bucket = rate_buckets.setdefault(client_id, deque())
+        while bucket and now - bucket[0] > RATE_WINDOW:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT:
+            retry_after = max(1, int(RATE_WINDOW - (now - bucket[0])) + 1)
+            return JSONResponse(
+                status_code=429,
+                content={"error": "rate_limit_exceeded"},
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+    response = await call_next(request)
+    return response
 
 
 @app.middleware("http")
@@ -96,7 +125,7 @@ VENDOR_SUFFIXES = (
 )
 
 VENDOR_PATTERNS = [
-    re.compile(r"(?:from|Vendor|Bill(?:ed)? [Ff]rom|Seller)\s*[:\-]?\s*([A-Z][\w&\-\.]*(?:\s+[A-Z][\w&\-\.]*)*(?:\s+(?:" + VENDOR_SUFFIXES + r"))?)", re.MULTILINE),
+    re.compile(r"(?:from|Vendor|Bill(?:ed)? [Ff]rom|Seller)\s*[:\-]?\s*([A-Z][\w&\-]*(?:\s+[A-Z][\w&\-]*)*(?:\s+(?:" + VENDOR_SUFFIXES + r")\.?)?)", re.MULTILINE),
     re.compile(r"\b([A-Z][\w&\-]*(?:\s+[A-Z][\w&\-]*)*\s+(?:" + VENDOR_SUFFIXES + r")\.?)"),
 ]
 
@@ -193,3 +222,69 @@ def extract(req: ExtractRequest):
         return ExtractResponse(vendor="Unknown Vendor", amount=0.0, currency="USD", date=datetime.utcnow().strftime("%Y-%m-%d"))
 
     return ExtractResponse(vendor=vendor, amount=amount, currency=currency, date=date)
+
+
+# ---------- Orders API: idempotency + pagination ----------
+
+TOTAL_ORDERS = 41
+
+ORDERS_CATALOG = [
+    {"id": i, "email": EMAIL, "amount": round(10 + i * 3.37, 2), "product": f"Product-{i}"}
+    for i in range(1, TOTAL_ORDERS + 1)
+]
+
+idempotency_store = {}  # key -> order dict
+next_order_id = TOTAL_ORDERS + 1
+
+
+def encode_cursor(offset: int) -> str:
+    raw = str(offset).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_cursor(cursor: str) -> int:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode())
+        return int(raw.decode())
+    except Exception:
+        return 0
+
+
+@app.post("/orders")
+def create_order(
+    payload: dict = Body(default={}),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    global next_order_id
+
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key header required")
+
+    if idempotency_key in idempotency_store:
+        order = idempotency_store[idempotency_key]
+        return JSONResponse(status_code=200, content=order)
+
+    order_id = next_order_id
+    next_order_id += 1
+
+    order = {"id": order_id, "email": EMAIL}
+    if isinstance(payload, dict):
+        order.update(payload)
+    order["id"] = order_id  # id always authoritative
+
+    idempotency_store[idempotency_key] = order
+    return JSONResponse(status_code=201, content=order)
+
+
+@app.get("/orders")
+def list_orders(limit: int = Query(10, gt=0), cursor: Optional[str] = Query(None)):
+    offset = decode_cursor(cursor) if cursor else 0
+    items = ORDERS_CATALOG[offset: offset + limit]
+    new_offset = offset + len(items)
+    next_cursor = encode_cursor(new_offset) if new_offset < len(ORDERS_CATALOG) else None
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "next": next_cursor,
+        "orders": items,
+    }
