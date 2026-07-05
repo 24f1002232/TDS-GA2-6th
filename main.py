@@ -288,3 +288,10 @@ def list_orders(limit: int = Query(10, gt=0), cursor: Optional[str] = Query(None
         "next": next_cursor,
         "orders": items,
     }
+
+@app.get("/debug/bucket")
+def debug_bucket(client_id: str):
+    now = time.time()
+    bucket = rate_buckets.get(client_id, deque())
+    active = [t for t in bucket if now - t <= RATE_WINDOW]
+    return {"client_id": client_id, "count_in_window": len(active), "limit": RATE_LIMIT}
